@@ -109,7 +109,6 @@ for osd in current:
 df_remap = pd.DataFrame(rows).set_index('OSD')
 df_remap['PGs up'] = df_remap['PGs current'] + df_remap['Remap now'] + df_remap['Remap waiting']
 df_util = df_util.join(df_remap[['PGs current', 'Remap now', 'Remap waiting', 'PGs up']])
-# df_util['util current'] = df_util['util']
 df_util['util current'] = df_util['util'].round(4)
 # For active remaps, assume half of PG has transferred
 util_change = (0.5*df_util['Remap now'] + df_util['Remap waiting']) / df_util['PGs current']
@@ -130,8 +129,6 @@ df_util['dev abs'] = df_util['deviation'].abs()
 total_pgs = df_util['PGs up'].sum()
 
 df_top = df_util.copy()
-
-# print(df_top.loc[483])
 
 # Ignore small deviations
 f_below_min_dev = df_top['dev abs']<args.min
@@ -156,10 +153,6 @@ if f.any():
     if df_top.empty:
         print("No significant deviations with weight<1")
         quit()
-
-# print(df_top.sort_values('dev abs', ascending=False)) ; quit()
-# print(df_top.loc[483])
-# quit()
 
 # Restrict to top-N biggest deviations
 if args.limit is not None:
@@ -226,8 +219,6 @@ if not ok:
     quit()
 job_id = f'{dt.datetime.now().strftime('%Y-%m-%dT%H-%M')}'
 _cwd = "/root"
-# df_fn = f"reweight-table-{job_id}.csv"
-# script_fn = f"reweight-job-{job_id}.sh"
 df_fn = f"reweight-{job_id}.csv"
 script_fn = f"reweight-{job_id}.sh"
 if args.cephadm:
