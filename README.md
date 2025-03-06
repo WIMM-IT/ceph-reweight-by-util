@@ -1,14 +1,13 @@
 ## Motivation
 
-Built-in tool `ceph osd reweight-by-utilization` has bias for reducing high-util OSDs. 
-This seems the obvious solution until you consider where the displaced PGs go - if they go to other near-high-util OSDs then you'll need to rebalance again soon.
-Instead can they be directed to the low-util OSDs by re-weighting both high-util and low-util?
+This tool sits between 2 existing tools:
+- Ceph's built-in tool `ceph osd reweight-by-utilization` with questionable reweight decisions
+- [TheJJ/ceph-balancer modifies upmap and can violate your CRUSH rules](https://github.com/TheJJ/ceph-balancer/issues/41)
 
-This script has two other features:
-- never modifies Ceph, instead it generates a Bash script you run to apply rebalance
-- analyse "up" not "current" util, so can re-run during a live rebalance
-
-Note: "up util" is a rough measure, it assumes any PGs being actively remapped are 50% transferred (not waiting). If you know how to be more accurate please let me know.
+`ceph osd reweight-by-utilization` can have bias for reducing weights of high-util OSDs, and not equally consider increasing low-util OSDs. 
+This tool just addresses that deficiency.
+It also analyses "up" not "current" util, so can re-run during a live rebalance. 
+"up util" is a rough measure, assumes any PGs being actively remapped are 50% transferred.
 
 ## Install
 
