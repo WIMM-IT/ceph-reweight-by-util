@@ -104,6 +104,14 @@ for osd in current:
     pgs_change_wait = changes_waiting[osd]
     row_data = {'OSD': int(osd), 'PGs current': pgs_curr, 'Remap now': pgs_change_active, 'Remap waiting': pgs_change_wait}
     rows.append(row_data)
+missing_osds = sorted(list(set(df_util.index) - set(current.keys())))
+for osd in missing_osds:
+    # these are new osds
+    pgs_curr = 0
+    pgs_change_active = 0
+    pgs_change_wait = changes_waiting[osd]
+    row_data = {'OSD': int(osd), 'PGs current': pgs_curr, 'Remap now': pgs_change_active, 'Remap waiting': pgs_change_wait}
+    rows.append(row_data)
 df_remap = pd.DataFrame(rows).set_index('OSD')
 df_remap['PGs up'] = df_remap['PGs current'] + df_remap['Remap now'] + df_remap['Remap waiting']
 df_util = df_util.join(df_remap[['PGs current', 'Remap now', 'Remap waiting', 'PGs up']])
@@ -111,6 +119,11 @@ df_util['util current'] = df_util['util'].round(4)
 # For active remaps, assume half of PG has transferred
 util_change = (0.5*df_util['Remap now'] + df_util['Remap waiting']) / df_util['PGs current']
 df_util['util up'] = (df_util['util current'] * (1 + util_change)).round(4)
+fna = (df_util['PGs current']==0).to_numpy()
+if fna.any():
+    # Assume new OSDs that haven't receiving a full PG yet
+    # Set util to average of pool
+    df_util.loc[fna, 'util up'] = df_util['util up'][~fna].mean()
 df_util = df_util.drop('util', axis=1)
 
 if args.osd is not None:
