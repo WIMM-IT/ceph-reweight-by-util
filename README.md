@@ -19,7 +19,7 @@ Then download and run script `reweight.py ... | tee rebalance.sh`
 ## Use
 
 ```
-usage: reweight.py [-h] -p POOL [-m MIN] [-d OUTDIR] [-l LIMIT] [-o OSD] [-s]
+usage: reweight.py [-h] -p POOL [-m MIN] [-l LIMIT] [-o OSD] [-s] [-e EXCLUDE_HOST]
 
 Calculate Ceph OSD reweights using deviation from mean utilisation %. Only calculate - reweight is
 still a manual task for you to review. Accounts for any PGs currently being remapped (ceph pg dump
@@ -33,11 +33,14 @@ options:
                         Optional: limit to N OSDs with biggest deviation
   -o OSD, --osd OSD     Optional: print detailed information for this OSD number
   -s, --cephadm         Run Ceph query commands via cephadm shell
+  -e EXCLUDE_HOST, --exclude-host EXCLUDE_HOST
+                        Exclude these hosts matching these regex patterns. Can be used multiple
+                        times.
 ```
 
 ## Example
 
-Reweight OSDs with util deviation 2.2% from mean
+- Reweight OSDs with util deviation 2.2% from mean
 
 > python3 ./reweight.py -p $pool -m 2.2 | tee rebalance.sh
 
@@ -54,3 +57,7 @@ id
 483        0.7853   0.7853  0.95079     0.98769  0.0369      61          2.4
 # PGs to write = 20 = 0.1%
 ```
+
+- Exclude multiple hosts
+
+> python3 ./reweight.py ... -e "ceph-r(1|3)n(13|14)" -e "ceph-r2n(14|15)"

@@ -19,6 +19,7 @@ parser.add_argument('-m', '--min', type=float, default=5.0, help='Deviation thre
 parser.add_argument('-l', '--limit', type=int, default=None, help='Optional: limit to N OSDs with biggest deviation')
 parser.add_argument('-o', '--osd', type=int, default=None, help='Optional: print detailed information for this OSD number')
 parser.add_argument('-s', '--cephadm', action='store_true', help='Run Ceph query commands via cephadm shell')
+parser.add_argument('-e', '--exclude-host', action='append', default=[], help='Exclude these hosts matching these regex patterns. Can be used multiple times.')
 args = parser.parse_args()
 if args.min < 0 or args.min > 100:
     raise ValueError(f'Argument "min" must be between 0 and 100, but provided value is outside range: {args.limit}')
@@ -31,12 +32,15 @@ util_cmd = "ceph osd df plain | grep up | tr -s ' ' | sed 's/^ //' | cut -d' ' -
 util_cols = ['id', 'weight', 'util']
 pgs_cmd = "ceph pg dump pgs_brief"
 draining_cmd = "ceph orch osd rm status | tail -n+2 | cut -d' ' -f1"
+osd2host_cmd = 'ceph osd metadata -f json | jq -r \'.[] | "\\(.id) \\(.hostname)"\''
+osd2host_cols = ['id', 'host']
 
 if args.cephadm:
     pool_osds_cmd = "./cephadm shell -- " + pool_osds_cmd
     util_cmd = "./cephadm shell -- " + util_cmd
     pgs_cmd = "./cephadm shell -- " + pgs_cmd
     draining_cmd = "./cephadm shell -- " + draining_cmd
+    osd2host_cmd = "./cephadm shell -- " + osd2host_cmd
 
 print(f"Running: {pool_osds_cmd}", file=sys.stderr)
 output = subprocess.check_output(pool_osds_cmd, shell=True, text=True)
@@ -132,6 +136,26 @@ if args.osd is not None:
     else:
         print(df_util.loc[args.osd], file=sys.stderr)
 
+# Add on host names
+print(f"Running: {osd2host_cmd}", file=sys.stderr)
+proc = subprocess.run([osd2host_cmd], shell=True, capture_output=True, text=True)
+df_osd2host = pd.read_csv(io.StringIO(proc.stdout), sep=r'\s+', header=None, names=osd2host_cols)
+df_osd2host = df_osd2host.set_index('id')
+df_util = df_util.join(df_osd2host)
+
+# Exclude specified hosts based on regex patterns
+if args.exclude_host:
+    import re
+    f_exclude = np.zeros(len(df_util), dtype=bool)
+    for pat in args.exclude_host:
+        # Rewrite capture groups to non-capturing to avoid warning
+        pat = re.sub(r'\((?!\?P<|\?[:=!])', '(?:', pat)
+        f_exclude |= df_util['host'].str.contains(pat, regex=True)
+    if f_exclude.any():
+        excluded_hosts = df_util['host'][f_exclude].unique()
+        print(f"Excluding hosts: {list(excluded_hosts)}", file=sys.stderr)
+        df_util = df_util[~f_exclude]
+
 # Calculate deviation from mean utilisation
 mean_util = df_util['util up'].mean()
 print(f"# mean_util = {100*mean_util:.1f}%", file=sys.stderr)
@@ -176,7 +200,7 @@ df_top['weight shift'] = new_weight - df_top['weight']
 # Check if a shifted weight would be > 1.
 df_top['new weight'] = df_top['weight'] + df_top['weight shift']
 new_weight_max = (df_top['weight'] + df_top['weight shift']).max()
-new_weights = df_top[['util current', 'util up', 'weight', 'new weight', 'PGs up']].copy()
+new_weights = df_top[['host', 'util current', 'util up', 'weight', 'new weight', 'PGs up']].copy()
 if new_weight_max <= 1:
     # Simple, just change these selected OSD
     pass
@@ -212,7 +236,8 @@ if new_weights.empty:
     quit()
 new_weights = new_weights.sort_values('util up', ascending=False)
 new_weights['PGs to move'] = ((new_weights['shift'] / new_weights['weight']) * new_weights['PGs up']).round(1)
-cols_sorted = ['util current', 'util up', 'weight', 'new weight', 'shift', 'PGs up', 'PGs to move']
+cols_sorted = ['host', 'util current', 'util up', 'weight', 'new weight', 'shift', 'PGs up', 'PGs to move']
+
 print(f"# new_weights: count={len(new_weights)}", file=sys.stderr)
 print(new_weights[cols_sorted], file=sys.stderr)
 
