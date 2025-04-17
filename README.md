@@ -5,16 +5,19 @@ This tool sits between 2 existing tools:
 - [TheJJ/ceph-balancer modifies upmap and can violate your CRUSH rules](https://github.com/TheJJ/ceph-balancer/issues/41)
 
 `ceph osd reweight-by-utilization` can have bias for reducing weights of high-util OSDs, and not equally consider increasing low-util OSDs. 
-This tool just addresses that deficiency.
-It also analyses "up" not "current" util, so can re-run during a live rebalance. 
-"up util" is a rough measure, assumes any PGs being actively remapped are 50% transferred.
+This tool primarily just addresses that deficiency.
+
+Features:
+- analyse "up" not "current" util, so can run during a live rebalance - assumes PGs being actively remapped are 50% transferred
+- reweight a specific pool
+- exclude hostnames
 
 ## Install
 
 Install Python dependencies: Pandas Numpy
 > apt|dnf install python3-pandas python3-numpy
 
-Then download and run script `reweight.py ... | tee rebalance.sh`
+Then download [reweight.py](https://github.com/WIMM-IT/ceph-reweight-by-util/blob/main/reweight.py)
 
 ## Use
 
@@ -40,9 +43,11 @@ options:
 
 ## Example
 
-- Reweight OSDs with util deviation 2.2% from mean
+Reweight OSDs with util deviation 2.2% from mean
 
-> python3 ./reweight.py -p $pool -m 2.2 | tee rebalance.sh
+#### inspect plan
+
+> python3 ./reweight.py -p $pool -m 2.2 1>/dev/null
 
 ![](./Images/osds-util-annot.png)
 
@@ -58,6 +63,10 @@ id
 # PGs to write = 20 = 0.1%
 ```
 
-- Exclude multiple hosts
+#### create script that applies plan
+
+> python3 ./reweight.py ... | tee rebalance.sh
+
+#### exclude hosts
 
 > python3 ./reweight.py ... -e "ceph-r(1|3)n(13|14)" -e "ceph-r2n(14|15)"
