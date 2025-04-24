@@ -116,7 +116,7 @@ def parse_osd_list(value):
     clean_str = value.strip('[]')
     return {int(x.strip()) for x in clean_str.split(',') if x.strip()}
 current = Counter()
-changes_active = Counter()
+changes_done = Counter()
 changes_waiting = Counter()
 backfilling_pgs_new_ups = {}
 up_osds_all = set()
@@ -132,19 +132,14 @@ for _, row in df_pgs.iterrows():
     for osd in acting_osds:
         current[osd] += 1
     for osd in acting_osds - up_osds:
-        if waiting:
-            changes_waiting[osd] -= 1
-        else:
-            changes_active[osd] -= 1
+        # Waiting to be allowed to leave Acting set
+        changes_waiting[osd] -= 1
     for osd in up_osds - acting_osds:
         if waiting:
             changes_waiting[osd] += 1
         else:
-            if backfilling:
-                backfilling_pgs_new_ups[pg_id].append(osd)
-                # Will calculate the percent transferred later
-            else:
-                changes_active[osd] += 1
+            backfilling_pgs_new_ups[pg_id].append(osd)
+            # Will calculate the percent transferred later
 
 # Backfilling PG stats
 backfilling_osds = set()
@@ -187,18 +182,24 @@ if backfilling_pgs_new_ups:
         result = subprocess.run(composite_backfill_cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     else:
         result = subprocess.run(script_path, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
     backfill_output = result.stdout
     bf_stats = json.loads(backfill_output)
     bf_stats = {x['pg']:x for x in bf_stats}
+
+    if args.osd is not None:
+        print(f"# OSD {args.osd} backfilling PGs:", file=sys.stderr)
     for pg in bf_stats.keys():
         pg_stats = bf_stats[pg]
         for peer_stats in pg_stats['peers']:
             osd = int(peer_stats['peer'])
             if osd in up_osds_all:
+                if args.osd is not None and osd == args.osd:
+                    print(peer_stats, file=sys.stderr)
                 pct = peer_stats['percent_missing']
-                changes_active[osd] += (1-pct)
+                changes_done[osd] += (1-pct)
                 changes_waiting[osd] += pct
+    if args.osd is not None:
+        print(f"", file=sys.stderr)
 
 if args.cephadm:
     shutil.rmtree(mount_dir)
@@ -206,28 +207,29 @@ if args.cephadm:
 rows = []
 for osd in current:
     pgs_curr = current[osd]
-    pgs_change_active = round(changes_active[osd], 1)
-    pgs_change_wait = round(changes_waiting[osd], 1)
-    row_data = {'OSD': int(osd), 'PGs current': pgs_curr, 'Remap now': pgs_change_active, 'Remap waiting': pgs_change_wait}
+    pgs_change_done = changes_done[osd]
+    pgs_change_wait = changes_waiting[osd]
+    row_data = {'OSD': int(osd), 'PGs current': pgs_curr, 'Remap done': pgs_change_done, 'Remap waiting': pgs_change_wait}
     rows.append(row_data)
 missing_osds = sorted(list(set(df_util.index) - set(current.keys())))
 for osd in missing_osds:
     # these are new osds
     pgs_curr = 0
-    pgs_change_active = 0
+    pgs_change_done = 0
     pgs_change_wait = changes_waiting[osd]
-    row_data = {'OSD': int(osd), 'PGs current': pgs_curr, 'Remap now': pgs_change_active, 'Remap waiting': pgs_change_wait}
+    row_data = {'OSD': int(osd), 'PGs current': pgs_curr, 'Remap done': pgs_change_done, 'Remap waiting': pgs_change_wait}
     rows.append(row_data)
 df_remap = pd.DataFrame(rows).set_index('OSD')
-df_remap['PGs up'] = (df_remap['PGs current'] + df_remap['Remap now'] + df_remap['Remap waiting']).round(0).astype('int')
-df_util = df_util.join(df_remap[['PGs current', 'Remap now', 'Remap waiting', 'PGs up']])
-df_util['util curr'] = df_util['util'].round(4)
-util_change = (df_util['Remap now'] + df_util['Remap waiting']) / df_util['PGs current']
-df_util['util up'] = (df_util['util curr'] * (1 + util_change)).round(4)
+df_remap['PGs up'] = (df_remap['PGs current'] + df_remap['Remap done'] + df_remap['Remap waiting']).round(0).astype('int')
+df_util = df_util.join(df_remap[['PGs current', 'Remap done', 'Remap waiting', 'PGs up']])
+df_util['util curr'] = df_util['util']#.round(4)
+df_util['util up'] = df_util['util curr'] * (df_util['PGs current']+df_util['Remap done']+df_util['Remap waiting']) / (df_util['PGs current']+df_util['Remap done'])
 fna = (df_util['PGs current']==0).to_numpy()
 if fna.any():
     # For new OSDs that haven't receiving a full PG yet, assume util = pool average
     df_util.loc[fna, 'util up'] = df_util['util up'][~fna].mean()
+df_util['util curr'] = df_util['util curr'].round(4)
+df_util['util up'] = df_util['util up'].round(4)
 df_util = df_util.drop('util', axis=1)
 
 if args.osd is not None:
