@@ -29,7 +29,7 @@ if args.limit is not None and args.limit < 1:
 
 pool_osds_cmd = f'ceph pg ls-by-pool {args.pool} | tr -s " " | cut -d" " -f15 | tail -n+2'
 util_cmd = "ceph osd df plain | grep up | tr -s ' ' | sed 's/^ //' | cut -d' ' -f1,4,17"
-util_cols = ['id', 'weight', 'util']
+util_cols = ['id', 'wgt', 'util']
 pgs_cmd = "ceph pg dump pgs_brief"
 draining_cmd = "ceph orch osd rm status | tail -n+2 | cut -d' ' -f1"
 osd2host_cmd = 'ceph osd metadata -f json | jq -r \'.[] | "\\(.id) \\(.hostname)"\''
@@ -119,10 +119,10 @@ for osd in missing_osds:
 df_remap = pd.DataFrame(rows).set_index('OSD')
 df_remap['PGs up'] = df_remap['PGs current'] + df_remap['Remap now'] + df_remap['Remap waiting']
 df_util = df_util.join(df_remap[['PGs current', 'Remap now', 'Remap waiting', 'PGs up']])
-df_util['util current'] = df_util['util'].round(4)
+df_util['util curr'] = df_util['util'].round(4)
 # For active remaps, assume half of PG has transferred
 util_change = (0.5*df_util['Remap now'] + df_util['Remap waiting']) / df_util['PGs current']
-df_util['util up'] = (df_util['util current'] * (1 + util_change)).round(4)
+df_util['util up'] = (df_util['util curr'] * (1 + util_change)).round(4)
 fna = (df_util['PGs current']==0).to_numpy()
 if fna.any():
     # Assume new OSDs that haven't receiving a full PG yet
@@ -175,7 +175,7 @@ if f_below_min_dev.any():
         quit()
 
 # Discard OSDs with util < mean but weight=1.0, because no room to increase weight.
-f = (df_top['weight']==1.0) & (df_top['util up']<mean_util)
+f = (df_top['wgt']==1.0) & (df_top['util up']<mean_util)
 if f.any():
     if np.sum(f) < 5:
         maxxed_osds = sorted(df_top.index[f].tolist())
@@ -194,55 +194,53 @@ if args.limit is not None:
     df_top = df_top.sort_values('dev abs', ascending=False).iloc[:args.limit]
 
 # Set new weights to exactly where we want them, not a vague shift.
-new_weight = df_top['weight'] * (mean_util / df_top['util up'])
-df_top['weight shift'] = new_weight - df_top['weight']
+new_weight = df_top['wgt'] * (mean_util / df_top['util up'])
+df_top['wgt shift'] = new_weight - df_top['wgt']
 
 # Check if a shifted weight would be > 1.
-df_top['new weight'] = df_top['weight'] + df_top['weight shift']
-new_weight_max = (df_top['weight'] + df_top['weight shift']).max()
-new_weights = df_top[['host', 'util current', 'util up', 'weight', 'new weight', 'PGs up']].copy()
+df_top['new wgt'] = df_top['wgt'] + df_top['wgt shift']
+new_weight_max = (df_top['wgt'] + df_top['wgt shift']).max()
+new_weights = df_top[['host', 'util curr', 'util up', 'wgt', 'new wgt', 'PGs up']].copy()
 if new_weight_max <= 1:
     # Simple, just change these selected OSD
     pass
 else:
-    scale_factor = 1 / new_weight_max
-    # print(f"WARNING: new_weight_max = {new_weight_max}")
-
     # # Oh dear, need to change ALL weights.
-    # Because if we just downscale the top new weights, 
-    # then they can be almost identical to current weights.
-
+    # # Because if we just downscale the top new weights, 
+    # # then they can be almost identical to current weights.
+    # scale_factor = 1 / new_weight_max
     # df_util_wo_top = df_util[~df_util.index.isin(df_top.index)].copy()           
-    # df_util_wo_top['new weight'] = df_util_wo_top['weight'] * scale_factor
-    # new_weights1 = df_top[['weight', 'new weight']]
-    # new_weights2 = df_util_wo_top[['weight', 'new weight']]
+    # df_util_wo_top['new wgt'] = df_util_wo_top['wgt'] * scale_factor
+    # cols = ['host', 'util curr', 'util up', 'wgt', 'new wgt', 'PGs up']
+    # new_weights1 = df_top[cols]
+    # new_weights2 = df_util_wo_top[cols]
     # new_weights = pd.concat([new_weights1, new_weights2])
     
     # But that may put big load on Ceph, so just cap the max.
     # But at some point, must reweight all OSDs.
-    f_above_1 = new_weights['new weight'] > 1.0
+    f_above_1 = new_weights['new wgt'] > 1.0
     if f_above_1.any():
         print(f"Clipping {np.sum(f_above_1)} new weights to maximum 1.0", file=sys.stderr)
-        new_weights['new weight'] = new_weights['new weight'].clip(upper=1.0)
+        new_weights['new wgt'] = new_weights['new wgt'].clip(upper=1.0)
 
-new_weights['new weight'] = new_weights['new weight'].round(5)
-new_weights['shift'] = (new_weights['new weight'] - new_weights['weight']).round(4)
+new_weights['new wgt'] = new_weights['new wgt'].round(5)
+new_weights['shift'] = (new_weights['new wgt'] - new_weights['wgt']).round(3)
 # reduce shift, because I'm worried there is still flip-flopping
 print("Reducing weight shift by 25%, because I'm worried there is still flip-flopping.", file=sys.stderr)
-new_weights['shift'] = (new_weights['shift']*0.75).round(4) ; new_weights['new weight'] = new_weights['weight'] + new_weights['shift']
+new_weights['shift'] = (new_weights['shift']*0.75).round(4) ; new_weights['new wgt'] = new_weights['wgt'] + new_weights['shift']
 new_weights = new_weights[new_weights['shift'] != 0]
 if new_weights.empty:
     print("No significant reweights needed", file=sys.stderr)
     quit()
 new_weights = new_weights.sort_values('util up', ascending=False)
-new_weights['PGs to move'] = ((new_weights['shift'] / new_weights['weight']) * new_weights['PGs up']).round(1)
-cols_sorted = ['host', 'util current', 'util up', 'weight', 'new weight', 'shift', 'PGs up', 'PGs to move']
+new_weights['PGs mv'] = ((new_weights['shift'] / new_weights['wgt']) * new_weights['PGs up']).round(1)
+cols_sorted = ['host', 'util curr', 'util up', 'wgt', 'new wgt', 'shift', 'PGs up', 'PGs mv']
 
 print(f"# new_weights: count={len(new_weights)}", file=sys.stderr)
 print(new_weights[cols_sorted], file=sys.stderr)
 
-pgs_pushed = abs((new_weights['PGs to move'][new_weights['PGs to move']<0]).sum())
-pgs_pulled = abs((new_weights['PGs to move'][new_weights['PGs to move']>0]).sum())
+pgs_pushed = abs((new_weights['PGs mv'][new_weights['PGs mv']<0]).sum())
+pgs_pulled = abs((new_weights['PGs mv'][new_weights['PGs mv']>0]).sum())
 max_pgs_written = max(pgs_pushed, pgs_pulled)
 print(f"# PGs to write = {max_pgs_written:.0f} = {100*max_pgs_written/total_pgs:.1f}%", file=sys.stderr)
 
@@ -255,7 +253,7 @@ for i in range(len(new_weights)):
     osd_id = row.name
     if isinstance(osd_id, (int, np.int64)):
         osd_id = "osd."+str(osd_id)
-    weight = row['new weight']
+    weight = row['new wgt']
     print(f"ceph osd reweight {osd_id} {weight:.5f}")
 #print("ceph osd unset norebalance")
 print('echo "To trigger rebalance run: ceph osd unset norebalance"')
