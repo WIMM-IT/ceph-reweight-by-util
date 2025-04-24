@@ -3,6 +3,8 @@ import io
 import sys
 from collections import Counter
 import re
+import os, tempfile, shutil
+import re, json
 
 # Can install these via apt:
 import pandas as pd
@@ -15,7 +17,6 @@ help_msg += " Accounts for any PGs currently being remapped (ceph pg dump pgs_br
 parser = argparse.ArgumentParser(description=help_msg)
 parser.add_argument('-p', '--pool', type=str, required=True, help="Focus on this Ceph pool")
 parser.add_argument('-m', '--min', type=float, default=5.0, help='Deviation threshold. E.g. 5 means: ignore OSDs within mean util %% +-5%%')
-# parser.add_argument('-d', '--outdir', type=str, default="reweight-job-dir", help="Store reweight job script in this folder. This Python script does not actually apply weights")
 parser.add_argument('-l', '--limit', type=int, default=None, help='Optional: limit to N OSDs with biggest deviation')
 parser.add_argument('-o', '--osd', type=int, default=None, help='Optional: print detailed information for this OSD number')
 parser.add_argument('-s', '--cephadm', action='store_true', help='Run Ceph query commands via cephadm shell')
@@ -36,16 +37,43 @@ osd2host_cmd = 'ceph osd metadata -f json | jq -r \'.[] | "\\(.id) \\(.hostname)
 osd2host_cols = ['id', 'host']
 
 if args.cephadm:
-    pool_osds_cmd = "./cephadm shell -- " + pool_osds_cmd
-    util_cmd = "./cephadm shell -- " + util_cmd
-    pgs_cmd = "./cephadm shell -- " + pgs_cmd
-    draining_cmd = "./cephadm shell -- " + draining_cmd
-    osd2host_cmd = "./cephadm shell -- " + osd2host_cmd
+    mount_dir = tempfile.mkdtemp(prefix="cephadm_", dir="/tmp")
+    container_mount_dir = f"/mnt/{os.path.basename(mount_dir)}"
 
-print(f"Running: {pool_osds_cmd}", file=sys.stderr)
-output = subprocess.check_output(pool_osds_cmd, shell=True, text=True)
+    commands_script = f"""#!/bin/bash
+    {pool_osds_cmd} > {container_mount_dir}/pool_osds.out
+    {util_cmd} > {container_mount_dir}/util.out
+    {draining_cmd} > {container_mount_dir}/draining.out
+    {pgs_cmd} > {container_mount_dir}/pgs.out
+    {osd2host_cmd} > {container_mount_dir}/osd2host.out
+    """
+
+    commands_script_path = os.path.join(mount_dir, "commands.sh")
+    with open(commands_script_path, "w") as f:
+        f.write(commands_script)
+    os.chmod(commands_script_path, 0o755)
+
+    composite_cmd = f"./cephadm shell --mount {mount_dir} -- bash {container_mount_dir}/commands.sh"
+    subprocess.run(composite_cmd, shell=True, check=True)
+
+    with open(os.path.join(mount_dir, "pool_osds.out"), "r") as f:
+         pool_osds_stdout = f.read()
+    with open(os.path.join(mount_dir, "util.out"), "r") as f:
+         util_stdout = f.read()
+    with open(os.path.join(mount_dir, "draining.out"), "r") as f:
+         draining_stdout = f.read()
+    with open(os.path.join(mount_dir, "pgs.out"), "r") as f:
+         pgs_stdout = f.read()
+    with open(os.path.join(mount_dir, "osd2host.out"), "r") as f:
+         osd2host_stdout = f.read()
+else:
+    pass
+
+if not args.cephadm:
+    print(f"Running: {pool_osds_cmd}", file=sys.stderr)
+    pool_osds_stdout = subprocess.check_output(pool_osds_cmd, shell=True, text=True)
 pool_osds = set()
-for line in re.findall(r'\[[\d,]+\]', output):
+for line in re.findall(r'\[[\d,]+\]', pool_osds_stdout):
    nums = line.strip('[]').split(',')
    pool_osds.update(int(n) for n in nums)
 if len(pool_osds) == 0:
@@ -55,29 +83,34 @@ if len(pool_osds) == 0:
     msg += "\n    " + pool_osds_cmd
     raise Exception(msg)
 
-print(f"Running: {util_cmd}", file=sys.stderr)
-proc = subprocess.run([util_cmd], shell=True, capture_output=True, text=True)
-df_util = pd.read_csv(io.StringIO(proc.stdout), sep=r'\s+', header=None, names=util_cols)
+if not args.cephadm:
+    print(f"Running: {util_cmd}", file=sys.stderr)
+    proc = subprocess.run([util_cmd], shell=True, capture_output=True, text=True)
+    util_stdout = proc.stdout
+
+df_util = pd.read_csv(io.StringIO(util_stdout), sep=r'\s+', header=None, names=util_cols)
 df_util['id'] = df_util['id'].astype(int)
 df_util = df_util.set_index('id').sort_index()
 df_util = df_util[df_util.index.isin(pool_osds)]
 # Convert util to same 0->1 range as weight, avoids confusion.
 df_util['util'] *= 0.01
 
-# Ignore OSDs currently being drained
-print(f"Running: {draining_cmd}", file=sys.stderr)
-proc = subprocess.run([draining_cmd], shell=True, capture_output=True, text=True)
-df_draining = pd.read_csv(io.StringIO(proc.stdout), sep=r'\s+', header=None, names=['id'])
+if not args.cephadm:
+    print(f"Running: {draining_cmd}", file=sys.stderr)
+    proc = subprocess.run([draining_cmd], shell=True, capture_output=True, text=True)
+    draining_stdout = proc.stdout
+
+df_draining = pd.read_csv(io.StringIO(draining_stdout), sep=r'\s+', header=None, names=['id'])
 if not df_draining.empty:
     df_draining['id'] = df_draining['id'].astype(int)
     print(f"Ignoring draining OSDs: {df_draining['id'].to_numpy()}", file=sys.stderr)
     df_util = df_util[~df_util.index.isin(df_draining['id'])]
 
-# Suppose a remap is already underway. Then instead of using current utilisation, 
-# calculate and use the post-remap utilisation.
-print(f"Running: {pgs_cmd}", file=sys.stderr)
-proc = subprocess.run([pgs_cmd], shell=True, capture_output=True, text=True)
-df_pgs = pd.read_csv(io.StringIO(proc.stdout), sep=r'\s+', header=0)
+if not args.cephadm:
+    print(f"Running: {pgs_cmd}", file=sys.stderr)
+    proc = subprocess.run([pgs_cmd], shell=True, capture_output=True, text=True)
+    pgs_stdout = proc.stdout
+df_pgs = pd.read_csv(io.StringIO(pgs_stdout), sep=r'\s+', header=0)
 df_pgs = df_pgs.set_index('PG_STAT')
 def parse_osd_list(value):
     clean_str = value.strip('[]')
@@ -85,10 +118,17 @@ def parse_osd_list(value):
 current = Counter()
 changes_active = Counter()
 changes_waiting = Counter()
+backfilling_pgs_new_ups = {}
+up_osds_all = set()
 for _, row in df_pgs.iterrows():
     up_osds = parse_osd_list(row['UP'])
+    up_osds_all.update(up_osds)
     acting_osds = parse_osd_list(row['ACTING'])
     waiting = 'wait' in row['STATE']
+    backfilling = 'backfilling' in row['STATE']
+    if backfilling:
+        pg_id = row.name
+        backfilling_pgs_new_ups[pg_id] = []
     for osd in acting_osds:
         current[osd] += 1
     for osd in acting_osds - up_osds:
@@ -100,12 +140,74 @@ for _, row in df_pgs.iterrows():
         if waiting:
             changes_waiting[osd] += 1
         else:
-            changes_active[osd] += 1
+            if backfilling:
+                backfilling_pgs_new_ups[pg_id].append(osd)
+                # Will calculate the percent transferred later
+            else:
+                changes_active[osd] += 1
+
+# Backfilling PG stats
+backfilling_osds = set()
+if backfilling_pgs_new_ups:
+    bash_script = "#!/bin/bash\n"
+    bash_script += "echo \"[\"\n"
+    bash_script += "first=1\n"
+    for pg, allowed_peers in backfilling_pgs_new_ups.items():
+        # Convert allowed peers to strings since JSON output uses strings
+        allowed_list = [str(peer) for peer in allowed_peers]
+        allowed_json = json.dumps(allowed_list)
+        # Fetch the PG query output and determine total objects.
+        bash_script += f"query=$(ceph pg {pg} query -f json)\n"
+        bash_script += "total=$(echo \"$query\" | jq '.info.stats.stat_sum.num_objects')\n"
+        # Use jq to filter peer info based on allowed peers; note the careful quoting.
+        bash_script += "json_peer=$(echo \"$query\" | jq --argjson allowed '" + allowed_json + "' --arg total \"$total\" '[.peer_info[] | select(.peer as $p | $allowed | index($p)) | {peer: .peer, percent_missing: ((.stats.stat_sum.num_objects_missing/($total|tonumber))), percent_misplaced: ((.stats.stat_sum.num_objects_misplaced/($total|tonumber)))}]')\n"
+        # Build a JSON object for this PG.
+        bash_script += f"json_pg=$(printf '{{\"pg\": \"{pg}\", \"total_objects\": %s, \"peers\": %s}}' \"$total\" \"$json_peer\")\n"
+        # Output with a comma prefix if not the first element.
+        bash_script += "if [ $first -eq 1 ]; then echo \"$json_pg\"; first=0; else echo \",\"; echo \"$json_pg\"; fi\n"
+    bash_script += "echo \"]\"\n"
+
+    # Determine where to write the script based on cephadm mode
+    if args.cephadm:
+        # Use the previously created mount_dir and container_mount_dir
+        script_path = os.path.join(mount_dir, "backfill_stats.sh")
+        container_script_path = os.path.join(container_mount_dir, "backfill_stats.sh")
+    else:
+        script_path = tempfile.mktemp(prefix="backfill_stats_", dir="/tmp")
+        container_script_path = script_path
+
+    with open(script_path, "w") as f:
+        f.write(bash_script)
+    os.chmod(script_path, 0o755)
+
+    # Run the script and capture its output
+    print(f"Querying Ceph for PGs backfill progress ...", file=sys.stderr)
+    if args.cephadm:
+        composite_backfill_cmd = f"./cephadm shell --mount {mount_dir} -- bash {container_script_path}"
+        result = subprocess.run(composite_backfill_cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    else:
+        result = subprocess.run(script_path, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    backfill_output = result.stdout
+    bf_stats = json.loads(backfill_output)
+    bf_stats = {x['pg']:x for x in bf_stats}
+    for pg in bf_stats.keys():
+        pg_stats = bf_stats[pg]
+        for peer_stats in pg_stats['peers']:
+            osd = int(peer_stats['peer'])
+            if osd in up_osds_all:
+                pct = peer_stats['percent_missing']
+                changes_active[osd] += (1-pct)
+                changes_waiting[osd] += pct
+
+if args.cephadm:
+    shutil.rmtree(mount_dir)
+
 rows = []
 for osd in current:
     pgs_curr = current[osd]
-    pgs_change_active = changes_active[osd]
-    pgs_change_wait = changes_waiting[osd]
+    pgs_change_active = round(changes_active[osd], 1)
+    pgs_change_wait = round(changes_waiting[osd], 1)
     row_data = {'OSD': int(osd), 'PGs current': pgs_curr, 'Remap now': pgs_change_active, 'Remap waiting': pgs_change_wait}
     rows.append(row_data)
 missing_osds = sorted(list(set(df_util.index) - set(current.keys())))
@@ -117,16 +219,14 @@ for osd in missing_osds:
     row_data = {'OSD': int(osd), 'PGs current': pgs_curr, 'Remap now': pgs_change_active, 'Remap waiting': pgs_change_wait}
     rows.append(row_data)
 df_remap = pd.DataFrame(rows).set_index('OSD')
-df_remap['PGs up'] = df_remap['PGs current'] + df_remap['Remap now'] + df_remap['Remap waiting']
+df_remap['PGs up'] = (df_remap['PGs current'] + df_remap['Remap now'] + df_remap['Remap waiting']).round(0).astype('int')
 df_util = df_util.join(df_remap[['PGs current', 'Remap now', 'Remap waiting', 'PGs up']])
 df_util['util curr'] = df_util['util'].round(4)
-# For active remaps, assume half of PG has transferred
-util_change = (0.5*df_util['Remap now'] + df_util['Remap waiting']) / df_util['PGs current']
+util_change = (df_util['Remap now'] + df_util['Remap waiting']) / df_util['PGs current']
 df_util['util up'] = (df_util['util curr'] * (1 + util_change)).round(4)
 fna = (df_util['PGs current']==0).to_numpy()
 if fna.any():
-    # Assume new OSDs that haven't receiving a full PG yet
-    # Set util to average of pool
+    # For new OSDs that haven't receiving a full PG yet, assume util = pool average
     df_util.loc[fna, 'util up'] = df_util['util up'][~fna].mean()
 df_util = df_util.drop('util', axis=1)
 
@@ -136,16 +236,17 @@ if args.osd is not None:
     else:
         print(df_util.loc[args.osd], file=sys.stderr)
 
-# Add on host names
-print(f"Running: {osd2host_cmd}", file=sys.stderr)
-proc = subprocess.run([osd2host_cmd], shell=True, capture_output=True, text=True)
-df_osd2host = pd.read_csv(io.StringIO(proc.stdout), sep=r'\s+', header=None, names=osd2host_cols)
+if not args.cephadm:
+    print(f"Running: {osd2host_cmd}", file=sys.stderr)
+    proc = subprocess.run([osd2host_cmd], shell=True, capture_output=True, text=True)
+    osd2host_stdout = proc.stdout
+
+df_osd2host = pd.read_csv(io.StringIO(osd2host_stdout), sep=r'\s+', header=None, names=osd2host_cols)
 df_osd2host = df_osd2host.set_index('id')
 df_util = df_util.join(df_osd2host)
 
 # Exclude specified hosts based on regex patterns
 if args.exclude_host:
-    import re
     f_exclude = np.zeros(len(df_util), dtype=bool)
     for pat in args.exclude_host:
         # Rewrite capture groups to non-capturing to avoid warning
@@ -225,9 +326,6 @@ else:
 
 new_weights['new wgt'] = new_weights['new wgt'].round(5)
 new_weights['shift'] = (new_weights['new wgt'] - new_weights['wgt']).round(3)
-# reduce shift, because I'm worried there is still flip-flopping
-print("Reducing weight shift by 25%, because I'm worried there is still flip-flopping.", file=sys.stderr)
-new_weights['shift'] = (new_weights['shift']*0.75).round(4) ; new_weights['new wgt'] = new_weights['wgt'] + new_weights['shift']
 new_weights = new_weights[new_weights['shift'] != 0]
 if new_weights.empty:
     print("No significant reweights needed", file=sys.stderr)
@@ -255,7 +353,6 @@ for i in range(len(new_weights)):
         osd_id = "osd."+str(osd_id)
     weight = row['new wgt']
     print(f"ceph osd reweight {osd_id} {weight:.5f}")
-#print("ceph osd unset norebalance")
 print('echo "To trigger rebalance run: ceph osd unset norebalance"')
 print('echo "Or instead, re-run this script to refine weights."')
 print("")

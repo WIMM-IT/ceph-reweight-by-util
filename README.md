@@ -8,7 +8,7 @@ This tool sits between 2 existing tools:
 This tool primarily just addresses that deficiency.
 
 Features:
-- analyse "up" not "current" util, so can run during a live rebalance - assumes PGs being actively remapped are 50% transferred
+- analyse Up not Current utilisation, so can run during a rebalance - query Ceph for accurate PG backfill progress
 - reweight a specific pool
 - exclude hostnames
 
