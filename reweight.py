@@ -347,7 +347,7 @@ print(f"# PGs to write = {max_pgs_written:.0f} = {100*max_pgs_written/total_pgs:
 # Write Bash commands to stdout
 print("#!/bin/bash")
 print("ceph osd set norebalance")
-print("sleep 5")
+print("sleep 1")
 for i in range(len(new_weights)):
     row = new_weights.iloc[i]
     osd_id = row.name
@@ -355,6 +355,5 @@ for i in range(len(new_weights)):
         osd_id = "osd."+str(osd_id)
     weight = row['new wgt']
     print(f"ceph osd reweight {osd_id} {weight:.5f}")
-print('echo "To trigger rebalance run: ceph osd unset norebalance"')
-print('echo "Or instead, re-run this script to refine weights."')
+print("ceph osd unset norebalance")
 print("")
