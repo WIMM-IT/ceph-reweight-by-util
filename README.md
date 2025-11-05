@@ -80,7 +80,7 @@ Argument `--virtual-max` handles this situation.
 Set it to 1.1 to allow script to calculate reweights in range [0, 1.1], 
 then when generating the Ceph reweight commands all reweights are downscaled to range [0, 1].
 
-The first time you apply a plan made with `VIRTUAL_MAX`, 
-expect significant remapping even if relatively the reweights have not changed.
+The first time you apply a plan made with `VIRTUAL_MAX`, expect significant remapping even if relatively the reweights have not changed.
 This is a consequence of Ceph deriving CRUSH map with hashing.
-So for subsequent reweights, you should maintain the same `VIRTUAL_MAX` value.
+So for the first use of `VIRTUAL_MAX`, ensure you reweight all OSDs i.e. set `--min` to 0.
+And for subsequent reweights, you should maintain the same `VIRTUAL_MAX` value.
