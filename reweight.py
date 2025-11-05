@@ -17,16 +17,23 @@ help_msg += " Accounts for any PGs currently being remapped (ceph pg dump pgs_br
 parser = argparse.ArgumentParser(description=help_msg)
 parser.add_argument('-p', '--pool', type=str, required=True, help="Focus on this Ceph pool")
 parser.add_argument('-m', '--min', type=float, default=5.0, help='Deviation threshold. E.g. 5 means: ignore OSDs within mean util %% +-5%%')
+parser.add_argument('-v', '--virtual-max', type=float, default=1.0, help='To help handle low-util OSDs with reweight already at maximum 1. Set virtual max to >1 to allow higher weights virtually, then ALL weights are downscaled to range [0,1]. Recommend always same value to minimise remapping.')
 parser.add_argument('-l', '--limit', type=int, default=None, help='Optional: limit to N OSDs with biggest deviation')
+parser.add_argument('-d', '--dampen', type=float, default=0.0, help='Dampen reweight shifts by this amount e.g. 0.1 for 10%% dampening')
 parser.add_argument('-o', '--osd', type=int, default=None, help='Optional: print detailed information for this OSD number')
 parser.add_argument('-s', '--cephadm', action='store_true', help='Run Ceph query commands via cephadm shell')
 parser.add_argument('-e', '--exclude-host', action='append', default=[], help='Exclude these hosts matching these regex patterns. Can be used multiple times.')
+parser.add_argument('-b', '--backup', action='store_true', help="Backup weights as a Bash restore script. Do nothing else")
 args = parser.parse_args()
 if args.min < 0 or args.min > 100:
     raise ValueError(f'Argument "min" must be between 0 and 100, but provided value is outside range: {args.limit}')
 args.min *= 0.01  # convert to 0->1
 if args.limit is not None and args.limit < 1:
     raise ValueError(f'Argument "limit" if set must be 1 or greater, not {args.limit}')
+if args.virtual_max is not None and args.virtual_max < 1:
+    raise ValueError(f'Argument "virtual-max" if set must be 1 or greater, not {args.virtual_max}')
+if args.dampen is not None and (args.dampen < 0.0 or args.dampen > 1.0):
+    raise ValueError(f'Argument "dampen" if set must be in range [0, 1]')
 
 pool_osds_cmd = f'ceph pg ls-by-pool {args.pool} | tr -s " " | cut -d" " -f15 | tail -n+2'
 util_cmd = "ceph osd df plain | grep up | tr -s ' ' | sed 's/^ //' | cut -d' ' -f1,4,17"
@@ -94,6 +101,23 @@ df_util = df_util.set_index('id').sort_index()
 df_util = df_util[df_util.index.isin(pool_osds)]
 # Convert util to same 0->1 range as weight, avoids confusion.
 df_util['util'] *= 0.01
+
+if args.backup:
+    # Write Bash commands to stdout
+    print("#!/bin/bash")
+    print("ceph osd set norebalance")
+    print("sleep 1")
+    for i in range(len(df_util)):
+        row = df_util.iloc[i]
+        osd_id = row.name
+        if isinstance(osd_id, (int, np.int64)):
+            osd_id = "osd."+str(osd_id)
+        weight = row['wgt']
+        print(f"ceph osd reweight {osd_id} {weight:.5f}")
+    print("echo 'When you are ready, run:'")
+    print("echo '  ceph osd unset norebalance'")
+    print("")
+    quit()
 
 if not args.cephadm:
     print(f"Running: {draining_cmd}", file=sys.stderr)
@@ -277,54 +301,26 @@ if f_below_min_dev.any():
         print("No significant deviations", file=sys.stderr)
         quit()
 
-# Discard OSDs with util < mean but weight=1.0, because no room to increase weight.
-f = (df_top['wgt']==1.0) & (df_top['util up']<mean_util)
-if f.any():
-    if np.sum(f) < 5:
-        maxxed_osds = sorted(df_top.index[f].tolist())
-        msg = f"Ignoring {np.sum(f)} OSDs because their util is < mean but their weight=1.0, can't increase weight: {maxxed_osds}"
-    else:
-        msg = f"Ignoring {np.sum(f)} OSDs because their util is < mean but their weight=1.0, can't increase weight."
-    print(msg, file=sys.stderr)
-    df_top = df_top[~f]
-    if df_top.empty:
-        print("No significant deviations with weight<1", file=sys.stderr)
-        quit()
-
-# Restrict to top-N biggest deviations
-if args.limit is not None:
-    print(f"Only analysing the top {args.limit} OSDs with biggest deviations", file=sys.stderr)
-    df_top = df_top.sort_values('dev abs', ascending=False).iloc[:args.limit]
-
 # Set new weights to exactly where we want them, not a vague shift.
 new_weight = df_top['wgt'] * (mean_util / df_top['util up'])
 df_top['wgt shift'] = new_weight - df_top['wgt']
 
+if args.dampen:
+  df_top['wgt shift'] *= 1-args.dampen
+
 # Check if a shifted weight would be > 1.
 df_top['new wgt'] = df_top['wgt'] + df_top['wgt shift']
 new_weight_max = (df_top['wgt'] + df_top['wgt shift']).max()
-new_weights = df_top[['host', 'util curr', 'util up', 'wgt', 'new wgt', 'PGs up']].copy()
-if new_weight_max <= 1:
-    # Simple, just change these selected OSD
-    pass
-else:
-    # # Oh dear, need to change ALL weights.
-    # # Because if we just downscale the top new weights, 
-    # # then they can be almost identical to current weights.
-    # scale_factor = 1 / new_weight_max
-    # df_util_wo_top = df_util[~df_util.index.isin(df_top.index)].copy()           
-    # df_util_wo_top['new wgt'] = df_util_wo_top['wgt'] * scale_factor
-    # cols = ['host', 'util curr', 'util up', 'wgt', 'new wgt', 'PGs up']
-    # new_weights1 = df_top[cols]
-    # new_weights2 = df_util_wo_top[cols]
-    # new_weights = pd.concat([new_weights1, new_weights2])
-    
-    # But that may put big load on Ceph, so just cap the max.
-    # But at some point, must reweight all OSDs.
-    f_above_1 = new_weights['new wgt'] > 1.0
-    if f_above_1.any():
-        print(f"Clipping {np.sum(f_above_1)} new weights to maximum 1.0", file=sys.stderr)
-        new_weights['new wgt'] = new_weights['new wgt'].clip(upper=1.0)
+cols = ['host', 'util curr', 'util up', 'dev abs', 'wgt', 'new wgt', 'PGs up']
+new_weights = df_top[cols].copy()
+if args.virtual_max > 1.0:
+    new_weights['new wgt'] *= 1/args.virtual_max
+new_weights['new wgt'] = new_weights['new wgt'].clip(upper=1.0)
+
+if args.limit is not None:
+    # Restrict to top-N biggest deviations
+    print(f"Only analysing the top {args.limit} OSDs with biggest deviations", file=sys.stderr)
+    new_weights = new_weights.sort_values('dev abs', ascending=False).iloc[:args.limit]
 
 new_weights['new wgt'] = new_weights['new wgt'].round(5)
 new_weights['shift'] = (new_weights['new wgt'] - new_weights['wgt']).round(3)
@@ -355,5 +351,6 @@ for i in range(len(new_weights)):
         osd_id = "osd."+str(osd_id)
     weight = row['new wgt']
     print(f"ceph osd reweight {osd_id} {weight:.5f}")
-print("ceph osd unset norebalance")
+print("echo 'When you are ready, run:'")
+print("echo '  ceph osd unset norebalance'")
 print("")
