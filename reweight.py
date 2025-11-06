@@ -17,9 +17,8 @@ help_msg += " Accounts for any PGs currently being remapped (ceph pg dump pgs_br
 parser = argparse.ArgumentParser(description=help_msg)
 parser.add_argument('-p', '--pool', type=str, required=True, help="Focus on this Ceph pool")
 parser.add_argument('-m', '--min', type=float, default=5.0, help='Deviation threshold. E.g. 5 means: ignore OSDs within mean util %% +-5%%')
-parser.add_argument('-v', '--virtual-max', type=float, default=1.0, help='To help handle low-util OSDs with reweight already at maximum 1. Set virtual max to >1 to allow higher weights virtually, then ALL weights are downscaled to range [0,1]. Recommend always same value to minimise remapping.')
 parser.add_argument('-l', '--limit', type=int, default=None, help='Optional: limit to N OSDs with biggest deviation')
-parser.add_argument('-d', '--dampen', type=float, default=0.0, help='Dampen reweight shifts by this amount e.g. 0.1 for 10%% dampening')
+parser.add_argument('-d', '--downscale', type=float, default=0.0, help='Downscale all weights by this amount e.g. 0.9 to reduce by 10%%. To give room to handle low-util OSDs with reweight already at maximum 1.')
 parser.add_argument('-o', '--osd', type=int, default=None, help='Optional: print detailed information for this OSD number')
 parser.add_argument('-s', '--cephadm', action='store_true', help='Run Ceph query commands via cephadm shell')
 parser.add_argument('-e', '--exclude-host', action='append', default=[], help='Exclude these hosts matching these regex patterns. Can be used multiple times.')
@@ -30,10 +29,8 @@ if args.min < 0 or args.min > 100:
 args.min *= 0.01  # convert to 0->1
 if args.limit is not None and args.limit < 1:
     raise ValueError(f'Argument "limit" if set must be 1 or greater, not {args.limit}')
-if args.virtual_max is not None and args.virtual_max < 1:
-    raise ValueError(f'Argument "virtual-max" if set must be 1 or greater, not {args.virtual_max}')
-if args.dampen is not None and (args.dampen < 0.0 or args.dampen > 1.0):
-    raise ValueError(f'Argument "dampen" if set must be in range [0, 1]')
+if args.downscale is not None and (args.downscale < 0.0 or args.downscale > 1.0):
+    raise ValueError(f'Argument "downscale" if set must be in range [0, 1]')
 
 pool_osds_cmd = f'ceph pg ls-by-pool {args.pool} | tr -s " " | cut -d" " -f15 | tail -n+2'
 util_cmd = "ceph osd df plain | grep up | tr -s ' ' | sed 's/^ //' | cut -d' ' -f1,4,17"
@@ -165,6 +162,9 @@ for _, row in df_pgs.iterrows():
             backfilling_pgs_new_ups[pg_id].append(osd)
             # Will calculate the percent transferred later
 
+# # Skip backfill progress
+# backfilling_pgs_new_ups = {}
+
 # Backfilling PG stats
 backfilling_osds = set()
 if backfilling_pgs_new_ups:
@@ -283,6 +283,24 @@ if args.exclude_host:
         print(f"Excluding hosts: {list(excluded_hosts)}", file=sys.stderr)
         df_util = df_util[~f_exclude]
 
+if args.downscale:
+    df_util['new wgt'] = df_util['wgt'] * args.downscale
+    # Write Bash commands to stdout
+    print("#!/bin/bash")
+    print("ceph osd set norebalance")
+    print("sleep 1")
+    for i in range(len(df_util)):
+        row = df_util.iloc[i]
+        osd_id = row.name
+        if isinstance(osd_id, (int, np.int64)):
+            osd_id = "osd."+str(osd_id)
+        weight = row['new wgt']
+        print(f"ceph osd reweight {osd_id} {weight:.5f}")
+    print("echo 'When you are ready, run:'")
+    print("echo '  ceph osd unset norebalance'")
+    print("")
+    quit()
+
 # Calculate deviation from mean utilisation
 mean_util = df_util['util up'].mean()
 print(f"# mean_util = {100*mean_util:.1f}%", file=sys.stderr)
@@ -290,31 +308,24 @@ df_util['deviation'] = df_util['util up'] - mean_util
 df_util['dev abs'] = df_util['deviation'].abs()
 total_pgs = df_util['PGs up'].sum()
 
-df_top = df_util.copy()
-
 # Ignore small deviations
-f_below_min_dev = df_top['dev abs']<args.min
+f_below_min_dev = df_util['dev abs']<args.min
 if f_below_min_dev.any():
     print(f'Ignoring {np.sum(f_below_min_dev)} OSDs as their deviation below threshold', file=sys.stderr)
-    df_top = df_top[~f_below_min_dev]
-    if df_top.empty:
+    df_util = df_util[~f_below_min_dev]
+    if df_util.empty:
         print("No significant deviations", file=sys.stderr)
         quit()
 
 # Set new weights to exactly where we want them, not a vague shift.
-new_weight = df_top['wgt'] * (mean_util / df_top['util up'])
-df_top['wgt shift'] = new_weight - df_top['wgt']
+new_weight = df_util['wgt'] * (mean_util / df_util['util up'])
+df_util['wgt shift'] = new_weight - df_util['wgt']
 
-if args.dampen:
-  df_top['wgt shift'] *= 1-args.dampen
-
-# Check if a shifted weight would be > 1.
-df_top['new wgt'] = df_top['wgt'] + df_top['wgt shift']
-new_weight_max = (df_top['wgt'] + df_top['wgt shift']).max()
+# Handle shifted weights >1.
+df_util['new wgt'] = df_util['wgt'] + df_util['wgt shift']
+new_weight_max = (df_util['wgt'] + df_util['wgt shift']).max()
 cols = ['host', 'util curr', 'util up', 'dev abs', 'wgt', 'new wgt', 'PGs up']
-new_weights = df_top[cols].copy()
-if args.virtual_max > 1.0:
-    new_weights['new wgt'] *= 1/args.virtual_max
+new_weights = df_util[cols].copy()
 new_weights['new wgt'] = new_weights['new wgt'].clip(upper=1.0)
 
 if args.limit is not None:

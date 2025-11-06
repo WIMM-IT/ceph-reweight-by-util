@@ -22,22 +22,21 @@ Then download [reweight.py](https://github.com/WIMM-IT/ceph-reweight-by-util/blo
 ## Use
 
 ```
-usage: reweight.py [-h] -p POOL [-m MIN] [-v VIRTUAL_MAX] [-l LIMIT] [-d DAMPEN] [-o OSD] [-s] [-e EXCLUDE_HOST] [-b]
+usage: reweight.py [-h] -p POOL [-m MIN] [-l LIMIT] [-d DOWNSCALE] [-o OSD] [-s] [-e EXCLUDE_HOST] [-b]
 
-Calculate Ceph OSD reweights using deviation from mean utilisation %. Only calculate - reweight action is still a manual task for you to review.
-Accounts for any PGs currently being remapped (ceph pg dump pgs_brief), by analysing the utilisation after current remap completes.
+Calculate Ceph OSD reweights using deviation from mean utilisation %. Only calculate - reweight is still a
+manual task for you to review. Accounts for any PGs currently being remapped (ceph pg dump pgs_brief), by
+analysing the utilisation after current remap completes.
 
 options:
   -h, --help            show this help message and exit
   -p POOL, --pool POOL  Focus on this Ceph pool
   -m MIN, --min MIN     Deviation threshold. E.g. 5 means: ignore OSDs within mean util % +-5%
-  -v VIRTUAL_MAX, --virtual-max VIRTUAL_MAX
-                        To help handle low-util OSDs with reweight already at maximum 1. Set virtual max to >1 to allow higher weights virtually,
-                        then ALL weights are downscaled to range [0,1]. Recommend always same value to minimise remapping.
   -l LIMIT, --limit LIMIT
                         Optional: limit to N OSDs with biggest deviation
-  -d DAMPEN, --dampen DAMPEN
-                        Dampen reweight shifts by this amount e.g. 0.1 for 10% dampening
+  -d DOWNSCALE, --downscale DOWNSCALE
+                        Downscale all weights by this amount e.g. 0.9 to reduce by 10%. To give room to handle
+                        low-util OSDs with reweight already at maximum 1.
   -o OSD, --osd OSD     Optional: print detailed information for this OSD number
   -s, --cephadm         Run Ceph query commands via cephadm shell
   -e EXCLUDE_HOST, --exclude-host EXCLUDE_HOST
@@ -73,14 +72,12 @@ id
 
 ## Advanced
 
-#### Virtual max
+#### Downscale
 
-It is not impossible for an OSD to have maximum reweight 1.0 but have utilisation well below the mean.
-Argument `--virtual-max` handles this situation.
-Set it to 1.1 to allow script to calculate reweights in range [0, 1.1], 
-then when generating the Ceph reweight commands all reweights are downscaled to range [0, 1].
+It is not impossible for an OSD to have maximum reweight 1.0 but have low utilisation well below the mean.
+Argument `--downscale` helps handle this situation.
+Set it to 0.9 to shift all reweights down by 10%.
+This creates headroom for increasing reweight on those low utilisation OSDs.
 
-The first time you apply a plan made with `VIRTUAL_MAX`, expect significant remapping even if relatively the reweights have not changed.
+Expect significant remapping even though relatively the reweights have not changed.
 This is a consequence of Ceph deriving CRUSH map with hashing.
-So for the first use of `VIRTUAL_MAX`, ensure you reweight all OSDs i.e. set `--min` to 0.
-And for subsequent reweights, you should maintain the same `VIRTUAL_MAX` value.
