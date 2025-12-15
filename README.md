@@ -22,25 +22,34 @@ Then download [reweight.py](https://github.com/WIMM-IT/ceph-reweight-by-util/blo
 ## Use
 
 ```
-usage: reweight.py [-h] -p POOL [-m MIN] [-l LIMIT] [-d DOWNSCALE] [-o OSD] [-s] [-e EXCLUDE_HOST] [-b]
+usage: reweight.py [-h] -p POOL [-m MIN] [-l LIMIT] [-d DOWNSCALE] [-r REDUCE_SHIFTS]
+                   [-o OSD] [-s] [-e EXCLUDE_HOST] [-i INCLUDE_HOST] [-b]
 
-Calculate Ceph OSD reweights using deviation from mean utilisation %. Only calculate - reweight is still a
-manual task for you to review. Accounts for any PGs currently being remapped (ceph pg dump pgs_brief), by
-analysing the utilisation after current remap completes.
+Calculate Ceph OSD reweights using deviation from mean utilisation %. Only calculate -
+reweight is still a manual task for you to review. Accounts for any PGs currently being
+remapped (ceph pg dump pgs_brief), by analysing the utilisation after current remap
+completes.
 
 options:
   -h, --help            show this help message and exit
   -p POOL, --pool POOL  Focus on this Ceph pool
-  -m MIN, --min MIN     Deviation threshold. E.g. 5 means: ignore OSDs within mean util % +-5%
+  -m MIN, --min MIN     Deviation threshold. E.g. 5 means: ignore OSDs within mean util %
+                        +-5%
   -l LIMIT, --limit LIMIT
                         Optional: limit to N OSDs with biggest deviation
   -d DOWNSCALE, --downscale DOWNSCALE
-                        Downscale all weights by this amount e.g. 0.9 to reduce by 10%. To give room to handle
-                        low-util OSDs with reweight already at maximum 1.
+                        Downscale all weights by this amount e.g. 0.9 to reduce by 10%. To
+                        give room to handle low-util OSDs with reweight already at maximum 1.
+  -r REDUCE_SHIFTS, --reduce-shifts REDUCE_SHIFTS
+                        Reduce weight shifts by this percent e.g. 0.1 to reduce by 10%
   -o OSD, --osd OSD     Optional: print detailed information for this OSD number
   -s, --cephadm         Run Ceph query commands via cephadm shell
   -e EXCLUDE_HOST, --exclude-host EXCLUDE_HOST
-                        Exclude these hosts matching these regex patterns. Can be used multiple times.
+                        Exclude these hosts matching these regex patterns. Can be used
+                        multiple times.
+  -i INCLUDE_HOST, --include-host INCLUDE_HOST
+                        Include these hosts matching these regex patterns. Can be used
+                        multiple times. Exclude everything else.
   -b, --backup          Backup weights as a Bash restore script. Do nothing else
 ```
 
