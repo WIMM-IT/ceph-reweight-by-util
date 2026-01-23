@@ -16,19 +16,25 @@ help_msg += " Only calculate - reweight is still a manual task for you to review
 help_msg += " Accounts for any PGs currently being remapped (ceph pg dump pgs_brief), by analysing the utilisation after current remap completes."
 parser = argparse.ArgumentParser(description=help_msg)
 parser.add_argument('-p', '--pool', type=str, required=True, help="Focus on this Ceph pool")
-parser.add_argument('-m', '--min', type=float, default=5.0, help='Deviation threshold. E.g. 5 means: ignore OSDs within mean util %% +-5%%')
+parser.add_argument('-m', '--min', type=float, default=5.0, help='Deviation threshold. E.g. 5 means: ignore OSDs within mean util %% +-5%%. If no deviations are above this threshold, then halt.')
+parser.add_argument('-f', '--flex', type=float, default=1.0, help='Add some flex around the deviation threshold. OSDs with deviations below threshold but within flex %% of it e.g. within 1%% of +-5%%, are also adjusted but have their reweight shifts reduced by 50%% (in addition to any other reductions). This is to help the above-threshold OSDs shift PGs.')
 parser.add_argument('-l', '--limit', type=int, default=None, help='Optional: limit to N OSDs with biggest deviation')
-parser.add_argument('-d', '--downscale', type=float, default=0.0, help='Downscale all weights by this amount e.g. 0.9 to reduce by 10%%. To give room to handle low-util OSDs with reweight already at maximum 1.')
-parser.add_argument('-r', '--reduce-shifts', type=float, default=0.0, help='Reduce weight shifts by this percent e.g. 0.1 to reduce by 10%')
+parser.add_argument('-d', '--downscale', type=float, default=0.0, help='Downscale all reweights by this amount e.g. 0.9 to reduce by 10%%. To give room to handle low-util OSDs with reweight already at maximum 1.')
+parser.add_argument('-r', '--reduce-shifts', type=float, default=0.0, help='Reduce reweight shifts by this percent e.g. 0.1 to reduce by 10%%')
 parser.add_argument('-o', '--osd', type=int, default=None, help='Optional: print detailed information for this OSD number')
 parser.add_argument('-s', '--cephadm', action='store_true', help='Run Ceph query commands via cephadm shell')
 parser.add_argument('-e', '--exclude-host', action='append', default=[], help='Exclude these hosts matching these regex patterns. Can be used multiple times.')
 parser.add_argument('-i', '--include-host', action='append', default=[], help='Include these hosts matching these regex patterns. Can be used multiple times. Exclude everything else.')
-parser.add_argument('-b', '--backup', action='store_true', help="Backup weights as a Bash restore script. Do nothing else")
+parser.add_argument('-b', '--backup', action='store_true', help="Backup reweights as a Bash restore script. Do nothing else")
 args = parser.parse_args()
 if args.min < 0 or args.min > 100:
     raise ValueError(f'Argument "min" must be between 0 and 100, but provided value is outside range: {args.limit}')
-args.min *= 0.01  # convert to 0->1
+args.min *= 0.01  # convert to range 0->1
+if args.flex < 0 or args.flex > 100:
+    raise ValueError(f'Argument "flex" must be between 0 and 100, but provided value is outside range: {args.limit}')
+if args.flex > args.min:
+    raise ValueError(f'Argument "flex" must not exceed argument "min": {args.limit}')
+args.flex *= 0.01  # convert to range 0->1
 if args.limit is not None and args.limit < 1:
     raise ValueError(f'Argument "limit" if set must be 1 or greater, not {args.limit}')
 if args.downscale is not None and (args.downscale < 0.0 or args.downscale > 1.0):
@@ -37,6 +43,8 @@ if args.reduce_shifts is not None and (args.reduce_shifts < 0.0 or args.reduce_s
     raise ValueError(f'Argument "reduce_shifts" if set must be in range [0, 1]')
 if len(args.exclude_host) > 0 and len(args.include_host) > 0:
     raise ValueError('Cannot combine exclude-host with include-host')
+
+min_sub_flex = max(0, args.min - args.flex)
 
 pool_osds_cmd = f'ceph pg ls-by-pool {args.pool} | tr -s " " | cut -d" " -f15 | tail -n+2'
 util_cmd = "ceph osd df plain | grep up | tr -s ' ' | sed 's/^ //' | cut -d' ' -f1,4,17"
@@ -329,15 +337,22 @@ total_pgs = df_util['PGs up'].sum()
 # Ignore small deviations
 f_below_min_dev = df_util['dev abs']<args.min
 if f_below_min_dev.any():
-    print(f'Ignoring {np.sum(f_below_min_dev)} OSDs as their deviation below threshold', file=sys.stderr)
-    df_util = df_util[~f_below_min_dev]
-    if df_util.empty:
+    if f_below_min_dev.all():
         print("No significant deviations", file=sys.stderr)
         quit()
+    f_below_min_dev = df_util['dev abs']<min_sub_flex
+    print(f'Ignoring {np.sum(f_below_min_dev)} OSDs as their deviation below threshold', file=sys.stderr)
+    df_util = df_util[~f_below_min_dev]
 
 # Set new weights to exactly where we want them, not a vague shift.
 new_weight = df_util['wgt'] * (mean_util / df_util['util up'])
 df_util['wgt shift'] = new_weight - df_util['wgt']
+
+if f_below_min_dev.any():
+    # Half the shift for those OSDs with deviation inside the flex buffer:
+    f_flex_buffer = (df_util['dev abs'].to_numpy()<args.min)
+    if f_flex_buffer.any():
+        df_util.loc[f_flex_buffer, 'wgt shift'] *= 0.5
 
 # Handle shifted weights >1.
 df_util['new wgt'] = df_util['wgt'] + df_util['wgt shift']
