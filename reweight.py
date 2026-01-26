@@ -17,10 +17,10 @@ help_msg += " Accounts for any PGs currently being remapped (ceph pg dump pgs_br
 parser = argparse.ArgumentParser(description=help_msg)
 parser.add_argument('-p', '--pool', type=str, required=True, help="Focus on this Ceph pool")
 parser.add_argument('-m', '--min', type=float, default=5.0, help='Deviation threshold. E.g. 5 means: ignore OSDs within mean util %% +-5%%. If no deviations are above this threshold, then halt.')
-parser.add_argument('-f', '--flex', type=float, default=1.0, help='Add some flex around the deviation threshold. OSDs with deviations below threshold but within flex %% of it e.g. within 1%% of +-5%%, are also adjusted but have their reweight shifts reduced by 50%% (in addition to any other reductions). This is to help the above-threshold OSDs shift PGs.')
+parser.add_argument('-f', '--flex', type=float, default=0.0, help='Add some flex around the deviation threshold. OSDs with deviations below threshold but within flex %% of it e.g. within 1%% of +-5%%, are also adjusted but have their reweight shifts reduced by 50%% (in addition to any other reductions). This is to help the above-threshold OSDs shift PGs.')
 parser.add_argument('-l', '--limit', type=int, default=None, help='Optional: limit to N OSDs with biggest deviation')
 parser.add_argument('-d', '--downscale', type=float, default=0.0, help='Downscale all reweights by this amount e.g. 0.9 to reduce by 10%%. To give room to handle low-util OSDs with reweight already at maximum 1.')
-parser.add_argument('-r', '--reduce-shifts', type=float, default=0.0, help='Reduce reweight shifts by this percent e.g. 0.1 to reduce by 10%%')
+parser.add_argument('-r', '--reduce-shifts', type=float, default=1.0, help='Reduce reweight shifts TO this percent e.g. 0.333 to reduce to 33%%')
 parser.add_argument('-o', '--osd', type=int, default=None, help='Optional: print detailed information for this OSD number')
 parser.add_argument('-s', '--cephadm', action='store_true', help='Run Ceph query commands via cephadm shell')
 parser.add_argument('-e', '--exclude-host', action='append', default=[], help='Exclude these hosts matching these regex patterns. Can be used multiple times.')
@@ -29,12 +29,10 @@ parser.add_argument('-b', '--backup', action='store_true', help="Backup reweight
 args = parser.parse_args()
 if args.min < 0 or args.min > 100:
     raise ValueError(f'Argument "min" must be between 0 and 100, but provided value is outside range: {args.limit}')
-args.min *= 0.01  # convert to range 0->1
 if args.flex < 0 or args.flex > 100:
     raise ValueError(f'Argument "flex" must be between 0 and 100, but provided value is outside range: {args.limit}')
 if args.flex > args.min:
-    raise ValueError(f'Argument "flex" must not exceed argument "min": {args.limit}')
-args.flex *= 0.01  # convert to range 0->1
+    raise ValueError(f'Argument "flex" must not exceed argument "min": min={args.min} flex={args.flex}')
 if args.limit is not None and args.limit < 1:
     raise ValueError(f'Argument "limit" if set must be 1 or greater, not {args.limit}')
 if args.downscale is not None and (args.downscale < 0.0 or args.downscale > 1.0):
@@ -43,6 +41,9 @@ if args.reduce_shifts is not None and (args.reduce_shifts < 0.0 or args.reduce_s
     raise ValueError(f'Argument "reduce_shifts" if set must be in range [0, 1]')
 if len(args.exclude_host) > 0 and len(args.include_host) > 0:
     raise ValueError('Cannot combine exclude-host with include-host')
+
+args.min *= 0.01  # convert to range 0->1
+args.flex *= 0.01  # convert to range 0->1
 
 min_sub_flex = max(0, args.min - args.flex)
 
@@ -374,7 +375,7 @@ if new_weights.empty:
     quit()
 new_weights = new_weights.sort_values('util up', ascending=False)
 if args.reduce_shifts:
-    new_weights['shift'] *= (1.0 - args.reduce_shifts)
+    new_weights['shift'] *= args.reduce_shifts
 new_weights['PGs mv'] = ((new_weights['shift'] / new_weights['wgt']) * new_weights['PGs up']).round(1)
 cols_sorted = ['host', 'util curr', 'util up', 'wgt', 'new wgt', 'shift', 'PGs up', 'PGs mv']
 
