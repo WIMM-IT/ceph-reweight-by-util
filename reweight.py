@@ -50,7 +50,53 @@ min_sub_flex = max(0, args.min - args.flex)
 pool_osds_cmd = f'ceph pg ls-by-pool {args.pool} | tr -s " " | cut -d" " -f15 | tail -n+2'
 util_cmd = "ceph osd df plain | grep up | tr -s ' ' | sed 's/^ //' | cut -d' ' -f1,4,17"
 util_cols = ['id', 'wgt', 'util']
-pgs_cmd = "ceph pg dump pgs_brief"
+osd_df_cmd = r"""ceph osd df -f json | jq -r '
+(
+  ["id","kb","kb_used","kb_avail","utilization"]
+  | @tsv
+),
+(
+  .nodes[]
+  | select(.id >= 0)
+  | [.id, .kb, .kb_used, .kb_avail, .utilization]
+  | @tsv
+)
+'"""
+osd_df_cols = ['id', 'kb', 'kb_used', 'kb_avail', 'utilization']
+
+pgs_cmd_dump = "ceph pg dump pgs -f json"
+pgs_cmd_jq = r"""
+(
+  ["PG_STAT","STATE","NUM_BYTES","NUM_OBJECTS","UP","UP_PRIMARY","ACTING","ACTING_PRIMARY"]
+  | @tsv
+),
+(
+  [.pg_stats[]
+    | {
+        pgid, state,
+        num_bytes: (.stat_sum.num_bytes // 0),
+        num_objects: (.stat_sum.num_objects // 0),
+        up, up_primary,
+        acting, acting_primary
+      }
+  ]
+  | sort_by(.num_bytes)
+  | reverse[]
+  | [
+      .pgid, .state,
+      .num_bytes, .num_objects,
+      (.up | @json), .up_primary,
+      (.acting | @json), .acting_primary
+    ]
+  | @tsv
+)
+"""
+pgs_cmd_pipeline = f"""\
+{pgs_cmd_dump} | jq -r '
+{pgs_cmd_jq}
+'
+"""
+
 draining_cmd = "ceph orch osd rm status | tail -n+2 | cut -d' ' -f1"
 osd2host_cmd = 'ceph osd metadata -f json | jq -r \'.[] | "\\(.id) \\(.hostname)"\''
 osd2host_cols = ['id', 'host']
@@ -60,10 +106,16 @@ if args.cephadm:
     container_mount_dir = f"/mnt/{os.path.basename(mount_dir)}"
 
     commands_script = f"""#!/bin/bash
+    set -euo pipefail
     {pool_osds_cmd} > {container_mount_dir}/pool_osds.out
     {util_cmd} > {container_mount_dir}/util.out
+    (
+    {osd_df_cmd}
+    ) > {container_mount_dir}/osd_df.out
     {draining_cmd} > {container_mount_dir}/draining.out
-    {pgs_cmd} > {container_mount_dir}/pgs.out
+    (
+    {pgs_cmd_pipeline}
+    ) > {container_mount_dir}/pgs.out
     {osd2host_cmd} > {container_mount_dir}/osd2host.out
     """
 
@@ -79,6 +131,8 @@ if args.cephadm:
          pool_osds_stdout = f.read()
     with open(os.path.join(mount_dir, "util.out"), "r") as f:
          util_stdout = f.read()
+    with open(os.path.join(mount_dir, "osd_df.out"), "r") as f:
+         osd_df_stdout = f.read()
     with open(os.path.join(mount_dir, "draining.out"), "r") as f:
          draining_stdout = f.read()
     with open(os.path.join(mount_dir, "pgs.out"), "r") as f:
@@ -106,11 +160,23 @@ if not args.cephadm:
     print(f"Running: {util_cmd}", file=sys.stderr)
     proc = subprocess.run([util_cmd], shell=True, capture_output=True, text=True)
     util_stdout = proc.stdout
+    print(f"Running OSD df pipeline:\n{osd_df_cmd}", file=sys.stderr)
+    proc = subprocess.run(["bash", "-lc", osd_df_cmd], capture_output=True, text=True, check=True)
+    osd_df_stdout = proc.stdout
 
 df_util = pd.read_csv(io.StringIO(util_stdout), sep=r'\s+', header=None, names=util_cols)
 df_util['id'] = df_util['id'].astype(int)
 df_util = df_util.set_index('id').sort_index()
 df_util = df_util[df_util.index.isin(pool_osds)]
+# Actual OSD usage/capacity data from ceph osd df.
+df_osd_df = pd.read_csv(io.StringIO(osd_df_stdout), sep='\t', header=0)
+df_osd_df['id'] = df_osd_df['id'].astype(int)
+df_osd_df = df_osd_df.set_index('id').sort_index()
+df_osd_df = df_osd_df[df_osd_df.index.isin(pool_osds)]
+df_osd_df['GB total'] = df_osd_df['kb'] * 0.000001
+df_osd_df['GB used'] = df_osd_df['kb_used'] * 0.000001
+df_osd_df['GB avail'] = df_osd_df['kb_avail'] * 0.000001
+df_osd_df = df_osd_df.drop(['kb', 'kb_used', 'kb_avail'], axis=1)
 # Convert util to same 0->1 range as weight, avoids confusion.
 df_util['util'] *= 0.01
 
@@ -143,39 +209,48 @@ if not df_draining.empty:
     df_util = df_util[~df_util.index.isin(df_draining['id'])]
 
 if not args.cephadm:
-    print(f"Running: {pgs_cmd}", file=sys.stderr)
-    proc = subprocess.run([pgs_cmd], shell=True, capture_output=True, text=True)
+    print(f"Running PG pipeline:\n{pgs_cmd_pipeline}", file=sys.stderr)
+    proc = subprocess.run(["bash", "-lc", pgs_cmd_pipeline], capture_output=True, text=True, check=True)
     pgs_stdout = proc.stdout
-df_pgs = pd.read_csv(io.StringIO(pgs_stdout), sep=r'\s+', header=0)
+df_pgs = pd.read_csv(io.StringIO(pgs_stdout), sep='\t', header=0)
 df_pgs = df_pgs.set_index('PG_STAT')
 def parse_osd_list(value):
     clean_str = value.strip('[]')
     return {int(x.strip()) for x in clean_str.split(',') if x.strip()}
 current = Counter()
-changes_done = Counter()
 changes_waiting = Counter()
+bytes_current = Counter()
+bytes_waiting = Counter()
 backfilling_pgs_new_ups = {}
 up_osds_all = set()
 for _, row in df_pgs.iterrows():
+    pg = row.name
+    pg_bytes = row['NUM_BYTES']
     up_osds = parse_osd_list(row['UP'])
-    up_osds_all.update(up_osds)
     acting_osds = parse_osd_list(row['ACTING'])
-    waiting = 'wait' in row['STATE']
-    backfilling = 'backfilling' in row['STATE']
-    if backfilling:
-        pg_id = row.name
-        backfilling_pgs_new_ups[pg_id] = []
+    is_waiting = 'wait' in row['STATE']
+    is_backfilling = 'backfilling' in row['STATE']
+    if is_backfilling:
+        backfilling_pgs_new_ups[pg] = []
     for osd in acting_osds:
         current[osd] += 1
-    for osd in acting_osds - up_osds:
-        # Waiting to be allowed to leave Acting set
+        bytes_current[osd] += pg_bytes
+    osds_waiting_to_leave = acting_osds - up_osds
+    osds_waiting_to_join = up_osds - acting_osds
+    for osd in osds_waiting_to_leave:
         changes_waiting[osd] -= 1
-    for osd in up_osds - acting_osds:
-        if waiting:
+        bytes_waiting[osd] -= pg_bytes
+    for osd in osds_waiting_to_join:
+        if is_waiting:
+            # Waiting to begin backfilling
             changes_waiting[osd] += 1
+            bytes_waiting[osd] += pg_bytes
         else:
-            backfilling_pgs_new_ups[pg_id].append(osd)
+            # Is backfilling now
+            backfilling_pgs_new_ups[pg].append(osd)
             # Will calculate the percent transferred later
+    
+    up_osds_all.update(up_osds)
 
 # # Skip backfill progress
 # backfilling_pgs_new_ups = {}
@@ -229,14 +304,17 @@ if backfilling_pgs_new_ups:
         print(f"# OSD {args.osd} backfilling PGs:", file=sys.stderr)
     for pg in bf_stats.keys():
         pg_stats = bf_stats[pg]
+        pg_bytes = df_pgs['NUM_BYTES'].loc[pg]
         for peer_stats in pg_stats['peers']:
             osd = int(peer_stats['peer'])
             if osd in up_osds_all:
                 if args.osd is not None and osd == args.osd:
                     print(peer_stats, file=sys.stderr)
                 pct = peer_stats['percent_missing']
-                changes_done[osd] += (1-pct)
+                current[osd] += (1-pct)
                 changes_waiting[osd] += pct
+                bytes_current[osd] += (1-pct)*pg_bytes
+                bytes_waiting[osd] += pct*pg_bytes
     if args.osd is not None:
         print(f"", file=sys.stderr)
 
@@ -246,9 +324,8 @@ if args.cephadm:
 rows = []
 for osd in current:
     pgs_curr = current[osd]
-    pgs_change_done = changes_done[osd]
     pgs_change_wait = changes_waiting[osd]
-    row_data = {'OSD': int(osd), 'PGs current': pgs_curr, 'Remap done': pgs_change_done, 'Remap waiting': pgs_change_wait}
+    row_data = {'OSD': int(osd), 'PGs current': pgs_curr, 'Remap waiting': pgs_change_wait}
     rows.append(row_data)
 missing_osds = sorted(list(set(df_util.index) - set(current.keys())))
 for osd in missing_osds:
@@ -259,10 +336,14 @@ for osd in missing_osds:
     row_data = {'OSD': int(osd), 'PGs current': pgs_curr, 'Remap done': pgs_change_done, 'Remap waiting': pgs_change_wait}
     rows.append(row_data)
 df_remap = pd.DataFrame(rows).set_index('OSD')
-df_remap['PGs up'] = (df_remap['PGs current'] + df_remap['Remap done'] + df_remap['Remap waiting']).round(0).astype('int')
-df_util = df_util.join(df_remap[['PGs current', 'Remap done', 'Remap waiting', 'PGs up']])
+df_remap['PGs up'] = (df_remap['PGs current'] + df_remap['Remap waiting']).round(0).astype('int')
+df_util = df_util.join(df_remap[['PGs current', 'Remap waiting', 'PGs up']])
 df_util['util curr'] = df_util['util']#.round(4)
-df_util['util up'] = df_util['util curr'] * (df_util['PGs current']+df_util['Remap done']+df_util['Remap waiting']) / (df_util['PGs current']+df_util['Remap done'])
+df_util = df_util.join(pd.Series(bytes_waiting, name='GB wait')*0.000000001)
+df_util.loc[df_util['GB wait'].isna(), 'GB wait'] = 0.0
+df_util = df_util.join(df_osd_df[['GB total', 'GB used', 'GB avail']])
+df_util['util up'] = (df_util['GB used'] + df_util['GB wait']) / df_util['GB total']
+
 fna = (df_util['PGs current']==0).to_numpy()
 if fna.any():
     # For new OSDs that haven't receiving a full PG yet, assume util = pool average
@@ -336,24 +417,30 @@ df_util['dev abs'] = df_util['deviation'].abs()
 total_pgs = df_util['PGs up'].sum()
 
 # Ignore small deviations
-f_below_min_dev = df_util['dev abs']<args.min
+f_below_min_dev = df_util['dev abs'].to_numpy() < args.min
 if f_below_min_dev.any():
     if f_below_min_dev.all():
         print("No significant deviations", file=sys.stderr)
         quit()
-    f_below_min_dev = df_util['dev abs']<min_sub_flex
-    print(f'Ignoring {np.sum(f_below_min_dev)} OSDs as their deviation below threshold', file=sys.stderr)
-    df_util = df_util[~f_below_min_dev]
+    f_below_min_dev = df_util['dev abs'].to_numpy() < min_sub_flex
+    if f_below_min_dev.any():
+        print(f'Ignoring {np.sum(f_below_min_dev)} OSDs as their deviation below threshold', file=sys.stderr)
+        df_util = df_util[~f_below_min_dev]
 
 # Set new weights to exactly where we want them, not a vague shift.
 new_weight = df_util['wgt'] * (mean_util / df_util['util up'])
 df_util['wgt shift'] = new_weight - df_util['wgt']
 
-if f_below_min_dev.any():
+if f_below_min_dev.any() and (min_sub_flex < args.min):
     # Half the shift for those OSDs with deviation inside the flex buffer:
     f_flex_buffer = (df_util['dev abs'].to_numpy()<args.min)
     if f_flex_buffer.any():
+        print(f'Halving weight shifts of {np.sum(f_flex_buffer)} OSDs as in flex buffer', file=sys.stderr)
         df_util.loc[f_flex_buffer, 'wgt shift'] *= 0.5
+
+
+if args.reduce_shifts:
+    df_util['wgt shift'] *= args.reduce_shifts
 
 # Handle shifted weights >1.
 df_util['new wgt'] = df_util['wgt'] + df_util['wgt shift']
@@ -374,8 +461,6 @@ if new_weights.empty:
     print("No significant reweights needed", file=sys.stderr)
     quit()
 new_weights = new_weights.sort_values('util up', ascending=False)
-if args.reduce_shifts:
-    new_weights['shift'] *= args.reduce_shifts
 new_weights['PGs mv'] = ((new_weights['shift'] / new_weights['wgt']) * new_weights['PGs up']).round(1)
 cols_sorted = ['host', 'util curr', 'util up', 'wgt', 'new wgt', 'shift', 'PGs up', 'PGs mv']
 
