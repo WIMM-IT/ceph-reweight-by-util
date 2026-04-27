@@ -340,7 +340,9 @@ df_remap['PGs up'] = (df_remap['PGs current'] + df_remap['Remap waiting']).round
 df_util = df_util.join(df_remap[['PGs current', 'Remap waiting', 'PGs up']])
 df_util['util curr'] = df_util['util']#.round(4)
 df_util = df_util.join(pd.Series(bytes_waiting, name='GB wait')*0.000000001)
-df_util.loc[df_util['GB wait'].isna(), 'GB wait'] = 0.0
+if df_util['GB wait'].isna().any():
+    df_util.loc[df_util['GB wait'].isna(), 'GB wait'] = 0.0
+    df_util['GB wait'] = df_util['GB wait'].astype('float')
 df_util = df_util.join(df_osd_df[['GB total', 'GB used', 'GB avail']])
 df_util['util up'] = (df_util['GB used'] + df_util['GB wait']) / df_util['GB total']
 
